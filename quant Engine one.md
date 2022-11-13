@@ -809,3 +809,223 @@ class EngineOne(BaseStrategy):
                     self.close()
                     return 
 ```
+
+# V7
+
+```python
+import talib
+from loguru import logger
+
+from db.fkline import find_csv
+from findex import ema, nake
+from strategy.BaseStrategy import BaseStrategy
+from util import dingutil as du
+
+
+def o_key(tag):
+    return f"engine_one_{tag}"
+
+
+class EngineOne(BaseStrategy):
+
+    def close_v2(self):
+        self.close()
+        # self.cool_down(240)
+        self.cool_down(240)
+
+    def __init__(self, _id, uid, s, margin, sid, mode, ext):
+        super().__init__(_id, uid, s, margin, sid, mode, ext)
+
+        df3m = find_csv(self.s, '3m', limit=500)
+        df3m['ma'] = talib.EMA(df3m['c'], 73)
+        df3m['ma2'] = talib.EMA(df3m['c'], 133)
+        df3m['bias'] = df3m['c'] - df3m['ma']
+        df3m['bias2'] = df3m['c'] - df3m['ma2']
+        df3m['bias_rate'] = df3m['bias'] / df3m['ma']
+        df3m['bias2_rate'] = df3m['bias2'] / df3m['ma2']
+        df3m = nake.nake_convert(df3m)
+        self.gp2 = ema.gold_pos_v2(df3m, 'ma', 'ma2')
+        self.dp2 = ema.dead_pos_v2(df3m, 'ma', 'ma2')
+        self.df3m = df3m
+
+        df1h = find_csv(self.s, '1h', limit=1000)
+        df1h['ma'] = talib.EMA(df1h['c'], 73)
+        df1h['ma2'] = talib.EMA(df1h['c'], 133)
+        df1h['bias'] = df1h['c'] - df1h['ma']
+        df1h['bias_rate'] = df1h['bias'] / df1h['ma']
+
+        self.df1h = df1h
+
+    def handle_in(self):
+        df1h = self.df1h
+        gp = ema.gold_pos_v2(df1h, 'ma', 'ma2')
+        dp = ema.dead_pos_v2(df1h, 'ma', 'ma2')
+        k1h = df1h.iloc[-1]
+        c = k1h['c']
+
+        df3m = self.df3m
+        k3m = self.df3m.iloc[-1]
+        pre = df3m.iloc[-2]
+
+        if gp > 10:
+            logger.info('逆转多头')
+            du.send_tag_time_uid('逆转为多头', 'xxxxxxxxx', 3600 * 8, 7)
+        else:
+            df15m = find_csv(self.s, '15m')
+
+            if abs(c - df1h[-50:-1]['l'].min()) / c < 1 / 100:
+                self.open_long()
+                self.save_loss_price(c - c * 3.5 / 100)
+                self.save_win_price(c + c * 5 / 100)
+                return
+            if self.dp2 > 0:
+                temp = self.dp2 - 1
+                if temp > 60:
+                    temp = 60
+                if temp > 1:
+                    sub = df3m[-temp:]
+                    if len(sub.query('bias2_rate > 0.015')) > 0:
+                        logger.info("41")
+                        return
+                    if len(sub.query('bias2_rate > 0 ')) > 6:
+                        logger.info("42")
+                        return
+                logger.info(k3m['bias_rate'])
+                if k3m['bias_rate'] < 0:
+                    if abs(k3m['bias_rate']) < 1.1 / 1000:
+                        # if not pre['yy']:
+                        self.open_short()
+                        return
+                            # 是否触发macd的背离
+            if self.gp2 > 10:
+                if df15m[-20:]['l'].min() < df15m[-50:-20]['l'].min():
+                    logger.info('上涨无力')
+                    return
+                temp = self.gp2 - 1
+                if temp > 60:
+                    temp = 60
+                if temp > 1:
+                    sub = df3m[-temp:]
+                    if len(sub.query('bias2_rate < -0.015')) > 0:
+                        return
+                    if len(sub.query('bias2_rate < 0 ')) > 6:
+                        return
+                if pre['yy'] and k3m['bias_rate'] > 0 and k3m['bias_rate'] < 3 / 1000:
+                    logger.info(f'考虑多吗? {k3m["c"]} {k3m["ma"]}')
+                    self.open_long()
+                    self.save_loss_price(df3m[-60:]['l'].min() - c / 100)
+                    return
+
+    def handle_win_out(self):
+        df1h = self.df1h
+        gp = ema.gold_pos_v2(df1h, 'ma', 'ma2')
+        dp = ema.dead_pos_v2(df1h, 'ma', 'ma2')
+        super().handle_win_out()
+
+        if self.has_order:
+            if self.is_now_long():
+                if self.get_pure_win() > 1 / 100:
+                    self.close()
+                    return
+
+        df = self.df3m
+        k3m = self.df3m.iloc[-1]
+        v1 = 1.7 / 100
+        wave = nake.max_wave(df[-100:])
+        if wave > 12 / 100:
+            v1 = 7 / 100
+        elif wave > 8 / 100:
+            v1 = 4 / 100
+        elif wave > 6 / 100:
+            v1 = 2.8 / 100
+
+        logger.info(f"v1 {v1}")
+        logger.info(k3m['bias_rate'])
+        if not self.has_order:
+            return
+        if self.get_pure_win() < 1 / 100:
+            return
+
+        if self.get_pure_win() > 7.5 / 100:
+            self.close_v2()
+            return
+        pm = self.get_price_move()
+        c = k3m['c']
+        back = 2 / 100
+        if self.have_key('loss_price'):
+            v = float(self.get_key('loss_price'))
+            if self.is_now_long():
+                lp = c - c * back
+                if lp > v:
+                    self.save_loss_price(lp)
+            if self.is_now_short():
+                lp = c + c * back
+                if lp < v:
+                    self.save_loss_price(lp)
+        else:
+            if abs(pm) / c > 3 / 100:
+                if self.is_now_long():
+                    self.save_loss_price(c - c * 2 / 100)
+                if self.is_now_short():
+                    self.save_loss_price(c + c * 2 / 100)
+
+        if self.is_now_long():
+            if dp > 0:
+                v1 = 1.4 / 100
+                if self.get_pure_win() > 2.6 / 100:
+                    self.close()
+                    return
+
+            if k3m['bias_rate'] > v1:
+                self.close_v2()
+                return
+        if self.is_now_short():
+            if gp > 0:
+                if self.get_pure_win() > 2.2 / 100:
+                    self.close()
+                    return
+
+            if k3m['bias_rate'] < -v1:
+                self.close_v2()
+                return
+
+    def handle_loss_out(self):
+        super().handle_loss_out()
+        k3m = self.df3m.iloc[-1]
+        df3m = self.df3m
+        d31 = df3m[-35:]
+        d32 = df3m[-80:-35]
+        c = k3m['c']
+        if not self.have_key('loss_price'):
+            if self.has_order:
+                if self.is_now_short():
+                    # 保证不能亏太多
+                    self.save_loss_price(df3m[-50:]['h'].max() + c * 1 / 100)
+                if self.is_now_long():
+                    self.save_loss_price(df3m[-50:]['l'].min() - c / 100)
+
+        if self.has_order:
+            if self.get_pure_win() > -1 / 100:
+                return
+
+            if self.is_now_long():
+                if c < df3m[-100:-10]['l'].min():
+                    self.close_v2()
+                    return
+
+                if self.dp2 > 0:
+                    self.close()
+                    return
+
+            if self.is_now_short():
+                logger.info(df3m[-100:-10]['h'].max())
+                if c > df3m[-100:-10]['h'].max():
+                    self.close_v2()
+                    return
+                if self.gp2 > 0:
+                    self.close()
+                    return
+            if self.get_pure_win() < -3.5 / 100:
+                self.close_v2()
+                return
+```
